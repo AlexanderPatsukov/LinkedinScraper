@@ -154,10 +154,25 @@ class LinkedInGuestClient:
         if wait > 0:
             time.sleep(wait)
 
-    def get(self, url: str, params: dict | None = None, *, retries: int | None = None) -> str:
+    def get(
+        self,
+        url: str,
+        params: dict | None = None,
+        *,
+        retries: int | None = None,
+        fresh_cookies: bool = False,
+    ) -> str:
         last_error: Exception | None = None
         attempts = self.max_retries if retries is None else max(retries, 1)
         for attempt in range(1, attempts + 1):
+            if fresh_cookies:
+                # Гостевая кука даётся ровно на один просмотр страницы компании:
+                # первый запрос сессии проходит, второй с той же кукой получает
+                # 999 - и так независимо от паузы (проверено на 80 минутах
+                # простоя). Не отправляем её обратно: ровно так ведёт себя
+                # обычный curl и новая вкладка в инкогнито. Пауза между
+                # запросами сохраняется, нагрузка не растёт.
+                self.session.cookies.clear()
             self._throttle()
             self._last_request_at = time.monotonic()
             try:
@@ -212,10 +227,7 @@ class LinkedInGuestClient:
         return parse_job_detail(html)
 
     def company_profile(self, slug: str) -> CompanyProfile:
-        # Одна попытка: страницы компаний лимитируются чаще всего, и долгий
-        # бэкофф на каждую застопорил бы весь сбор. Блокировки считает вызывающий
-        # код, а непрогруженное подберёт «Догрузить недостающее».
-        html = self.get(COMPANY_URL.format(slug=slug), retries=1)
+        html = self.get(COMPANY_URL.format(slug=slug), retries=2, fresh_cookies=True)
         return parse_company_profile(html)
 
 

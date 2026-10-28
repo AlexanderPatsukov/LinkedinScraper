@@ -106,3 +106,6 @@ SCRAPER_USER_AGENT = os.environ.get(
 SCRAPER_DEFAULT_TIMEOUT = int(os.environ.get("SCRAPER_DEFAULT_TIMEOUT", "20"))
 SCRAPER_DEFAULT_DELAY = float(os.environ.get("SCRAPER_DEFAULT_DELAY", "2.0"))
 SCRAPER_MAX_RETRIES = int(os.environ.get("SCRAPER_MAX_RETRIES", "3"))
+# На сколько секунд фаза уходит на паузу после серии блокировок (999).
+# Каждая следующая пауза вдвое длиннее, но не больше часа.
+SCRAPER_BLOCK_COOLDOWN = float(os.environ.get("SCRAPER_BLOCK_COOLDOWN", "600"))

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import traceback
 from collections import Counter
 
@@ -53,9 +54,10 @@ from .parser import (
 
 logger = logging.getLogger(__name__)
 
-# Сколько блокировок подряд терпим, прежде чем отключить фазу до конца запуска.
-# Долбиться дальше бессмысленно и только продлевает бан - недогруженное
-# подберёт «Догрузить недостающее».
+# Сколько блокировок подряд терпим, прежде чем отправить фазу на паузу.
+# Долбиться дальше бессмысленно и только продлевает бан, но и выключать фазу
+# насовсем нельзя: 999 транзиентный, через несколько минут те же URL снова
+# отдают 200.
 CONSECUTIVE_BLOCK_LIMIT = 3
 
 # Окна дат для деления по оси «дата публикации». Окна вложенные, а не
@@ -73,61 +75,94 @@ class BudgetExhausted(Exception):
     """Исчерпан бюджет запросов на запуск."""
 
 
-class _Budget:
-    """Бюджет запуска: блокировки подряд и лимит профилей компаний."""
+class _Phase:
+    """Состояние одной фазы (описания или компании) в пределах запуска.
 
-    def __init__(self, run: ParseRun, max_company_profiles: int = 0):
+    При серии блокировок фаза уходит на ПАУЗУ, а не выключается насовсем.
+    999 от LinkedIn транзиентный: те же самые URL через несколько минут снова
+    отдают 200. Глухое выключение означало бы, что три неудачи в начале
+    многочасового прогона лишают компаний весь прогон целиком.
+    """
+
+    def __init__(self, run: ParseRun, label: str, cooldown: float):
+        self.run = run
+        self.label = label
+        self.base_cooldown = cooldown
+        self.blocks_in_row = 0
+        self.pauses = 0
+        self.paused_until: float | None = None
+        self.stopped = False  # исчерпан лимит - это уже навсегда
+
+    @property
+    def off(self) -> bool:
+        if self.stopped:
+            return True
+        if self.paused_until is None:
+            return False
+        if time.monotonic() >= self.paused_until:
+            self.paused_until = None
+            self.blocks_in_row = 0
+            self.run.append_log(f"Пауза по {self.label} вышла - пробую снова.", save=False)
+            return False
+        return True
+
+    def note(self, result: str) -> None:
+        if result == "blocked":
+            self.blocks_in_row += 1
+            if self.blocks_in_row >= CONSECUTIVE_BLOCK_LIMIT:
+                self._pause()
+        else:
+            self.blocks_in_row = 0
+
+    def stop(self, reason: str) -> None:
+        if not self.stopped:
+            self.stopped = True
+            self.run.append_log(reason, save=False)
+
+    def _pause(self) -> None:
+        self.pauses += 1
+        # каждая следующая пауза вдвое длиннее, но не больше часа
+        cooldown = min(self.base_cooldown * (2 ** (self.pauses - 1)), 3600)
+        self.paused_until = time.monotonic() + cooldown
+        self.blocks_in_row = 0
+        self.run.append_log(
+            f"{CONSECUTIVE_BLOCK_LIMIT} блокировки подряд - {self.label} на паузе "
+            f"{int(cooldown // 60)} мин {int(cooldown % 60)} с, потом попробую снова.",
+            save=False,
+        )
+
+
+class _Budget:
+    """Бюджет запуска: паузы по блокировкам и лимит профилей компаний."""
+
+    def __init__(self, run: ParseRun, max_company_profiles: int = 0, cooldown: float = 600.0):
         self.run = run
         self.max_company_profiles = max_company_profiles
         self.companies_fetched = 0
-        self._company_blocks = 0
-        self._detail_blocks = 0
-        self.companies_off = False
-        self.details_off = False
+        self._companies = _Phase(run, "загрузку профилей компаний", cooldown)
+        self._details = _Phase(run, "загрузку описаний", cooldown)
+
+    @property
+    def companies_off(self) -> bool:
+        return self._companies.off
+
+    @property
+    def details_off(self) -> bool:
+        return self._details.off
 
     def note_company(self, result: str) -> None:
         if result == "ok":
             self.companies_fetched += 1
-            self._company_blocks = 0
-        elif result == "blocked":
-            self._company_blocks += 1
-            if self._company_blocks >= CONSECUTIVE_BLOCK_LIMIT:
-                self._disable("companies", "профилей компаний")
-        else:
-            self._company_blocks = 0
+        self._companies.note(result)
 
         if self.max_company_profiles and self.companies_fetched >= self.max_company_profiles:
-            if not self.companies_off:
-                self.companies_off = True
-                self.run.append_log(
-                    f"Достигнут лимит профилей компаний ({self.max_company_profiles}) - "
-                    "дальше только названия и ссылки.",
-                    save=False,
-                )
+            self._companies.stop(
+                f"Достигнут лимит профилей компаний ({self.max_company_profiles}) - "
+                "дальше только названия и ссылки."
+            )
 
     def note_detail(self, result: str) -> None:
-        if result == "blocked":
-            self._detail_blocks += 1
-            if self._detail_blocks >= CONSECUTIVE_BLOCK_LIMIT:
-                self._disable("details", "описаний")
-        else:
-            self._detail_blocks = 0
-
-    def _disable(self, kind: str, label: str) -> None:
-        if kind == "companies":
-            if self.companies_off:
-                return
-            self.companies_off = True
-        else:
-            if self.details_off:
-                return
-            self.details_off = True
-        self.run.append_log(
-            f"{CONSECUTIVE_BLOCK_LIMIT} блокировки подряд - прекращаю загрузку {label} "
-            "до конца этого запуска. Непрогруженное осталось в очереди: "
-            "запустите «Догрузить недостающее» позже.",
-            save=False,
-        )
+        self._details.note(result)
 
 
 def start_run(search_query: SearchQuery, *, backfill_only: bool = False) -> tuple[ParseRun | None, str]:
@@ -190,7 +225,11 @@ def execute_run(run_id: int) -> None:
         delay=query.delay_seconds if query.delay_seconds is not None else settings.SCRAPER_DEFAULT_DELAY,
         max_retries=settings.SCRAPER_MAX_RETRIES,
     )
-    budget = _Budget(run, max_company_profiles=query.max_company_profiles)
+    budget = _Budget(
+        run,
+        max_company_profiles=query.max_company_profiles,
+        cooldown=settings.SCRAPER_BLOCK_COOLDOWN,
+    )
 
     final_status = RunStatus.DONE
     try:
@@ -702,19 +741,40 @@ def _backfill(run: ParseRun, query: SearchQuery, client: LinkedInGuestClient, bu
         )
         run.append_log(f"Описания: в очереди {len(pending)} вакансий.", save=False)
         _save_counters(run)
-        _process_details(run, client, budget, pending)
+        _process_details(run, client, budget, pending, wait_on_pause=True)
     if query.fetch_companies:
         _process_companies(run, client, budget, query=query)
 
 
 # ------------------------------------------------------- обработка пачками
 
+def _wait_out_pause(run: ParseRun, is_off) -> bool:
+    """Пережидает паузу фазы, не теряя отзывчивости на «Остановить».
+
+    Нужно в режиме догрузки: там фаза - это весь смысл запуска, и выходить
+    из неё по первой же паузе бессмысленно. В обычном обходе ждать не нужно:
+    впереди ещё сотни страниц, пауза истечёт сама собой.
+    """
+    for _ in range(360):  # максимум 30 минут ожидания
+        _check_stop(run)
+        if not is_off():
+            return True
+        time.sleep(5)
+    return not is_off()
+
+
 def _process_details(
-    run: ParseRun, client: LinkedInGuestClient, budget: _Budget, vacancy_ids: list[int]
+    run: ParseRun,
+    client: LinkedInGuestClient,
+    budget: _Budget,
+    vacancy_ids: list[int],
+    *,
+    wait_on_pause: bool = False,
 ) -> None:
     for vacancy_id in vacancy_ids:
         if budget.details_off:
-            return
+            if not (wait_on_pause and _wait_out_pause(run, lambda: budget.details_off)):
+                return
         _check_stop(run)
         vacancy = Vacancy.objects.filter(pk=vacancy_id).first()
         if not vacancy or vacancy.status == VacancyStatus.DETAILED:
@@ -751,9 +811,11 @@ def _process_companies(
         run.append_log(f"Компании: в очереди {len(company_ids)} профилей.", save=False)
         _save_counters(run)
 
+    wait_on_pause = query is not None  # режим догрузки
     for company_id in company_ids:
         if budget.companies_off:
-            return
+            if not (wait_on_pause and _wait_out_pause(run, lambda: budget.companies_off)):
+                return
         _check_stop(run)
         company = Company.objects.filter(pk=company_id).first()
         if not company or company.details_fetched_at:

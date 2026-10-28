@@ -1,0 +1,40 @@
+name: linkedin-jobs
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: linkedin_jobs_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-linkedin_jobs}
+      POSTGRES_USER: ${POSTGRES_USER:-jobs}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jobs}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-jobs} -d ${POSTGRES_DB:-linkedin_jobs}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: linkedin-jobs-web:latest
+    container_name: linkedin_jobs_web
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8000}:8000"
+
+volumes:
+  pgdata:

@@ -505,7 +505,7 @@ class CompanyAdmin(admin.ModelAdmin):
     list_filter = ("industry", "company_size")
     search_fields = ("name", "slug", "industry", "headquarters", "description")
     list_per_page = 50
-    actions = ["action_fetch_profiles"]
+    actions = ["action_export_xlsx", "action_export_csv", "action_fetch_profiles"]
     readonly_fields = ("slug", "details_fetched_at", "created_at", "updated_at", "logo_preview", "open_link")
     fieldsets = (
         ("Компания", {"fields": ("name", "slug", "linkedin_url", "open_link", "logo_url", "logo_preview")}),
@@ -534,6 +534,14 @@ class CompanyAdmin(admin.ModelAdmin):
         if not obj.logo_url:
             return "-"
         return format_html('<img src="{}" style="max-height:80px;border-radius:6px">', obj.logo_url)
+
+    @admin.action(description="⬇ Выгрузить в Excel (.xlsx)")
+    def action_export_xlsx(self, request, queryset):
+        return exports.export_xlsx(queryset, exports.COMPANIES)
+
+    @admin.action(description="⬇ Выгрузить в CSV")
+    def action_export_csv(self, request, queryset):
+        return exports.export_csv(queryset, exports.COMPANIES)
 
     @admin.action(description="↻ Загрузить профили компаний")
     def action_fetch_profiles(self, request, queryset):

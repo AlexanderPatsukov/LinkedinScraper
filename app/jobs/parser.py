@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Iterable
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -58,6 +59,20 @@ def _clean(value: str | None) -> str:
     if not value:
         return ""
     return re.sub(r"\s+", " ", value).strip()
+
+
+def unwrap_redirect(url: str | None) -> str:
+    """Достаёт настоящий адрес из обёртки LinkedIn.
+
+    Сайт компании отдаётся не напрямую, а ссылкой вида
+    linkedin.com/redir/redirect?url=http%3A%2F%2Fexample%2Ecom&urlhash=...
+    В выгрузке такое бесполезно, поэтому разворачиваем. Если обёртки нет или
+    параметра url в ней не оказалось, возвращаем как есть.
+    """
+    if not url or "/redir/redirect" not in url:
+        return url or ""
+    target = parse_qs(urlparse(url).query).get("url", [""])[0]
+    return target or url
 
 
 def _company_slug(url: str | None) -> str:
@@ -376,7 +391,7 @@ def parse_company_profile(html: str) -> CompanyProfile:
         if attr == "website":
             link = value_el.select_one("a") if hasattr(value_el, "select_one") else None
             value = _clean(link.get("href")) if link and link.get("href") else value
-            value = value[:500]
+            value = unwrap_redirect(value)[:500]
         setattr(profile, attr, value[:255] if attr != "website" else value)
 
     followers_el = soup.select_one(".top-card-layout__first-subline .font-sans") or soup.select_one(
